@@ -25,7 +25,7 @@ from web3 import Web3
 # TELEGRAM CONFIG
 # ============================================================
 BOT_TOKEN = "8719727830:AAHjJkNfDTtLrqTkrMNZBWmF6nqKNzJrNyU"
-CHAT_ID = "8719727830"
+CHAT_ID = "6293608654"
 
 # ============================================================
 # CELO RPC & TOKEN CONTRACTS
