@@ -150,12 +150,6 @@ def poll_telegram_updates():
                             if mid:
                                 last_message_ids[chat_id] = mid
 
-                        if is_new:
-                            # Notif admin ada user baru
-                            send_to_user(
-                                ADMIN_CHAT_ID,
-                                f"👤 User baru join: <b>{first_name}</b> ({chat_id})"
-                            )
 
                     elif text == "/status":
                         # Kirim saldo saat ini
