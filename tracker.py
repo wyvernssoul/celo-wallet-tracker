@@ -51,6 +51,7 @@ WALLETS = [
         "tokens": ["USDC", "USDT"],
         "alert_low": 150,
         "alert_empty": 0,
+        "min_notif": 1000,      # Notif kalau perubahan >= $1000
     },
     {
         "name": "Dev Amerika 🇺🇸",
@@ -58,6 +59,7 @@ WALLETS = [
         "tokens": ["USDC"],
         "alert_low": 150,
         "alert_empty": 0,
+        "min_notif": 1000,
     },
     {
         "name": "Deposit Dev 🏦",
@@ -65,6 +67,7 @@ WALLETS = [
         "tokens": ["USDC", "USDT"],
         "alert_low": 500,
         "alert_empty": 50,
+        "min_notif": 1000,
     },
 ]
 
@@ -295,17 +298,21 @@ def check_all_wallets():
         all_balances[addr] = current
         prev = last_balances.get(addr, {})
 
+        min_notif = w.get("min_notif", 0)
+
         for token in w["tokens"]:
             cur_val = current.get(token, 0) or 0
             prev_val = prev.get(token, 0) or 0
             diff = cur_val - prev_val
             alert_key = f"{addr}_{token}"
 
-            if prev and abs(diff) >= 0.01:
+            # Cek perubahan saldo — cuma notif kalau >= min_notif
+            if prev and abs(diff) >= max(min_notif, 0.01):
                 has_change = True
                 if diff > 0 and alert_key in alert_sent:
                     del alert_sent[alert_key]
 
+            # Alert saldo habis (tetap jalan, gak kena min_notif)
             if w["alert_empty"] > 0 and cur_val < w["alert_empty"]:
                 if alert_sent.get(alert_key) != "empty":
                     alerts.append(
@@ -314,6 +321,7 @@ def check_all_wallets():
                     )
                     alert_sent[alert_key] = "empty"
 
+            # Alert saldo rendah (tetap jalan, gak kena min_notif)
             elif w["alert_low"] > 0 and cur_val < w["alert_low"]:
                 if alert_sent.get(alert_key) != "low":
                     alerts.append(
