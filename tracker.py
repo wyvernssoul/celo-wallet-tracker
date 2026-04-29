@@ -1,9 +1,8 @@
 """
-Celo Dev Wallet Tracker
-========================
+Celo Dev Wallet Tracker (Multi-User)
+======================================
 Track saldo USDT & USDC developer di jaringan Celo.
-1 pesan Telegram yang selalu di-update.
-Alert singkat kalau saldo rendah/habis.
+Siapa aja yang klik /start di bot, otomatis dapet notif.
 
 Cara pakai:
     pip install -r requirements.txt
@@ -14,6 +13,7 @@ import time
 import json
 import os
 import requests
+import threading
 from datetime import datetime
 from web3 import Web3
 
@@ -21,7 +21,10 @@ from web3 import Web3
 # TELEGRAM CONFIG
 # ============================================================
 BOT_TOKEN = "8719727830:AAHjJkNfDTtLrqTkrMNZBWmF6nqKNzJrNyU"
-CHAT_ID = "6293608654"
+ADMIN_CHAT_ID = "6293608654"  # Chat ID kamu (owner)
+
+# File simpan semua user yang /start
+USERS_FILE = "users.json"
 
 # ============================================================
 # CELO RPC & TOKEN CONTRACTS
@@ -73,8 +76,96 @@ CHECK_INTERVAL = 3
 w3 = Web3(Web3.HTTPProvider(CELO_RPC))
 last_balances = {}
 alert_sent = {}
-last_message_id = None  # ID pesan terakhir di Telegram (buat dihapus)
+last_message_ids = {}   # {chat_id: message_id} — per user
 LOG_FILE = "balance_log.json"
+
+
+# ============================================================
+# USER MANAGEMENT
+# ============================================================
+def load_users():
+    """Load semua chat_id user yang pernah /start."""
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    # Default: admin aja
+    return [ADMIN_CHAT_ID]
+
+
+def save_users(users):
+    """Simpan list user."""
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f)
+
+
+def add_user(chat_id):
+    """Tambah user baru."""
+    users = load_users()
+    chat_id_str = str(chat_id)
+    if chat_id_str not in users:
+        users.append(chat_id_str)
+        save_users(users)
+        print(f"  [+] New user: {chat_id_str}")
+        return True
+    return False
+
+
+# ============================================================
+# TELEGRAM POLLING (listen /start dari user baru)
+# ============================================================
+def poll_telegram_updates():
+    """Background thread: listen pesan masuk dari Telegram."""
+    last_update_id = 0
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+
+    while True:
+        try:
+            resp = requests.get(url, params={
+                "offset": last_update_id + 1,
+                "timeout": 30,
+            }, timeout=35)
+            data = resp.json()
+
+            if data.get("ok"):
+                for update in data.get("result", []):
+                    last_update_id = update["update_id"]
+                    msg = update.get("message", {})
+                    text = msg.get("text", "")
+                    chat_id = str(msg.get("chat", {}).get("id", ""))
+                    first_name = msg.get("from", {}).get("first_name", "")
+
+                    if not chat_id:
+                        continue
+
+                    if text == "/start":
+                        is_new = add_user(chat_id)
+
+                        # Kirim saldo saat ini ke user baru
+                        if last_balances:
+                            balance_msg = build_main_message(last_balances)
+                            mid = send_to_user(chat_id, balance_msg)
+                            if mid:
+                                last_message_ids[chat_id] = mid
+
+                        if is_new:
+                            # Notif admin ada user baru
+                            send_to_user(
+                                ADMIN_CHAT_ID,
+                                f"👤 User baru join: <b>{first_name}</b> ({chat_id})"
+                            )
+
+                    elif text == "/status":
+                        # Kirim saldo saat ini
+                        if last_balances:
+                            balance_msg = build_main_message(last_balances)
+                            send_to_user(chat_id, balance_msg)
+
+        except Exception as e:
+            print(f"  [!] Polling error: {e}")
+            time.sleep(5)
 
 
 # ============================================================
@@ -105,14 +196,14 @@ def get_wallet_balances(wallet_cfg):
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM SEND
 # ============================================================
-def send_telegram(message):
-    """Kirim pesan baru, return message_id."""
+def send_to_user(chat_id, message):
+    """Kirim pesan ke 1 user, return message_id."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         resp = requests.post(url, json={
-            "chat_id": CHAT_ID,
+            "chat_id": chat_id,
             "text": message,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
@@ -121,33 +212,50 @@ def send_telegram(message):
         if data.get("ok"):
             return data["result"]["message_id"]
         else:
-            print(f"  [!] Telegram error: {data}")
+            print(f"  [!] Telegram error ({chat_id}): {data.get('description','')}")
     except Exception as e:
-        print(f"  [!] Telegram failed: {e}")
+        print(f"  [!] Telegram failed ({chat_id}): {e}")
     return None
 
 
-def delete_telegram(message_id):
-    """Hapus pesan lama."""
+def delete_from_user(chat_id, message_id):
+    """Hapus pesan dari 1 user."""
     if not message_id:
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
     try:
         requests.post(url, json={
-            "chat_id": CHAT_ID,
+            "chat_id": chat_id,
             "message_id": message_id,
         }, timeout=10)
     except Exception:
         pass
 
 
-def send_alert(message):
-    """Kirim alert terpisah (gak dihapus)."""
-    send_telegram(message)
+def send_to_all(message):
+    """Kirim pesan ke semua user, return {chat_id: message_id}."""
+    users = load_users()
+    result = {}
+    for chat_id in users:
+        mid = send_to_user(chat_id, message)
+        if mid:
+            result[chat_id] = mid
+    return result
+
+
+def delete_all_old_messages():
+    """Hapus pesan lama dari semua user."""
+    for chat_id, mid in last_message_ids.items():
+        delete_from_user(chat_id, mid)
+
+
+def send_alert_to_all(message):
+    """Kirim alert ke semua user (gak dihapus)."""
+    send_to_all(message)
 
 
 # ============================================================
-# FORMAT PESAN UTAMA
+# FORMAT
 # ============================================================
 def format_usd(val):
     if val is None:
@@ -156,7 +264,6 @@ def format_usd(val):
 
 
 def build_main_message(all_balances):
-    """Buat pesan utama dengan saldo semua wallet."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     msg = f"🟢 <b>Wallet Tracker</b>\n"
@@ -184,7 +291,6 @@ def build_main_message(all_balances):
 # CEK & NOTIF
 # ============================================================
 def check_all_wallets():
-    """Cek semua wallet, return (all_balances, has_change, alerts)."""
     all_balances = {}
     has_change = False
     alerts = []
@@ -201,30 +307,23 @@ def check_all_wallets():
             diff = cur_val - prev_val
             alert_key = f"{addr}_{token}"
 
-            # Cek perubahan saldo
             if prev and abs(diff) >= 0.01:
                 has_change = True
-
-                # Reset alert kalau saldo naik
                 if diff > 0 and alert_key in alert_sent:
                     del alert_sent[alert_key]
 
-            # Cek alert saldo habis (Deposit Dev < $50)
             if w["alert_empty"] > 0 and cur_val < w["alert_empty"]:
                 if alert_sent.get(alert_key) != "empty":
-                    short_name = w["name"].split(" ")[0] + " " + w["name"].split(" ")[1] if len(w["name"].split(" ")) > 1 else w["name"]
                     alerts.append(
-                        f"🚨 <b>{short_name} {token} saldo habis!</b>\n"
+                        f"🚨 <b>{w['name']} {token} saldo habis!</b>\n"
                         f"Sisa: <b>{format_usd(cur_val)}</b>"
                     )
                     alert_sent[alert_key] = "empty"
 
-            # Cek alert saldo rendah
             elif w["alert_low"] > 0 and cur_val < w["alert_low"]:
                 if alert_sent.get(alert_key) != "low":
-                    short_name = w["name"].split("(")[0].strip() if "(" in w["name"] else w["name"]
                     alerts.append(
-                        f"⚠️ <b>{short_name} {token} low balance!</b>\n"
+                        f"⚠️ <b>{w['name']} {token} low balance!</b>\n"
                         f"Sisa: <b>{format_usd(cur_val)}</b>"
                     )
                     alert_sent[alert_key] = "low"
@@ -241,7 +340,6 @@ def save_log(entry):
         except Exception:
             logs = []
     logs.append(entry)
-    # Keep max 500 entries
     if len(logs) > 500:
         logs = logs[-500:]
     with open(LOG_FILE, "w", encoding="utf-8") as f:
@@ -252,10 +350,10 @@ def save_log(entry):
 # MAIN
 # ============================================================
 def main():
-    global last_message_id
+    global last_message_ids
 
     print("=" * 55)
-    print("  Celo Dev Wallet Tracker")
+    print("  Celo Dev Wallet Tracker (Multi-User)")
     print("=" * 55)
     print()
 
@@ -263,26 +361,32 @@ def main():
         print("[!] Gagal connect ke Celo RPC!")
         return
 
+    users = load_users()
     print(f"[OK] Connected ke Celo")
     print(f"[*] Tracking {len(WALLETS)} wallet(s)")
+    print(f"[*] Users: {len(users)}")
     print(f"[*] Interval: {CHECK_INTERVAL} detik")
     print()
 
-    # ---- Startup: ambil saldo awal & kirim pesan pertama ----
+    # Start background thread: listen /start dari user baru
+    t = threading.Thread(target=poll_telegram_updates, daemon=True)
+    t.start()
+    print("[OK] Telegram listener started")
+
+    # Startup: ambil saldo awal & kirim ke semua user
     print("[*] Mengambil saldo awal...")
     for w in WALLETS:
         last_balances[w["address"]] = get_wallet_balances(w)
 
     msg = build_main_message(last_balances)
-    last_message_id = send_telegram(msg)
-    print("[OK] Pesan awal terkirim!")
+    last_message_ids = send_to_all(msg)
+    print(f"[OK] Pesan awal terkirim ke {len(last_message_ids)} user!")
 
-    # Kirim alert awal kalau ada saldo rendah
+    # Alert awal
     _, _, startup_alerts = check_all_wallets()
     for alert_msg in startup_alerts:
-        send_alert(alert_msg)
+        send_alert_to_all(alert_msg)
 
-    # Update last_balances setelah startup
     for w in WALLETS:
         last_balances[w["address"]] = get_wallet_balances(w)
 
@@ -297,43 +401,41 @@ def main():
 
             if has_change:
                 now = datetime.now().strftime("%H:%M:%S")
-                print(f"  [{now}] Balance changed! Updating Telegram...")
+                print(f"  [{now}] Balance changed! Updating all users...")
 
-                # Hapus pesan lama
-                delete_telegram(last_message_id)
+                # Hapus pesan lama dari semua user
+                delete_all_old_messages()
 
-                # Kirim pesan baru dengan saldo terbaru
+                # Kirim pesan baru ke semua user
                 msg = build_main_message(all_balances)
-                last_message_id = send_telegram(msg)
+                last_message_ids = send_to_all(msg)
 
-                # Log perubahan
                 save_log({
                     "type": "change",
                     "balances": {a: b for a, b in all_balances.items()},
                     "waktu": datetime.now().isoformat(),
                 })
 
-                # Update last_balances
                 for w in WALLETS:
                     last_balances[w["address"]] = all_balances[w["address"]]
 
-            # Kirim alert (pesan terpisah, gak dihapus)
+            # Alert ke semua user
             for alert_msg in alerts:
-                send_alert(alert_msg)
+                send_alert_to_all(alert_msg)
                 now = datetime.now().strftime("%H:%M:%S")
-                print(f"  [{now}] Alert sent!")
+                print(f"  [{now}] Alert sent to all users!")
 
-            # Heartbeat tiap ~1 menit
             cycle += 1
             if cycle % (60 // CHECK_INTERVAL) == 0:
                 now = datetime.now().strftime("%H:%M:%S")
-                print(f"  [{now}] ♥ Running... (cycle #{cycle})")
+                users = load_users()
+                print(f"  [{now}] ♥ Running... (cycle #{cycle}, {len(users)} users)")
 
             time.sleep(CHECK_INTERVAL)
 
     except KeyboardInterrupt:
         print("\n\n[STOP] Tracker dihentikan.")
-        send_telegram("🔴 <b>Tracker Stopped</b>")
+        send_to_all("🔴 <b>Tracker Stopped</b>")
 
 
 if __name__ == "__main__":
